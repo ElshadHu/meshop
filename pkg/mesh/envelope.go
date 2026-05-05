@@ -1,4 +1,3 @@
-// Envelope wraps a single message exchanged between two peers
 package mesh
 
 import (
@@ -8,6 +7,7 @@ import (
 	"time"
 )
 
+// Envelope wraps a single message exchanged between two peers.
 type Envelope struct {
 	// ID is a message identifier
 	ID string `json:"id"`
