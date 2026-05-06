@@ -1,6 +1,7 @@
 package mesh
 
 import (
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -8,6 +9,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"time"
 )
 
 // MaxFrameBytes caps a single wire frame at 1 MIB. Receivers refuse larger
@@ -37,7 +39,8 @@ func (n *Node) ID() PeerID {
 }
 
 // Send writes  to the underlying conn as a length-prefixed JSON frame
-func (n *Node) Send(env Envelope) error {
+// it will serialises concurrent calls with an internal mutex
+func (n *Node) Send(ctx context.Context, env Envelope) error {
 	body, err := json.Marshal(env)
 	if err != nil {
 		return fmt.Errorf("mesh: marshal envelope: %w", err)
@@ -51,19 +54,37 @@ func (n *Node) Send(env Envelope) error {
 	n.sendMu.Lock()
 	defer n.sendMu.Unlock()
 
+	// A previous cancelled call maybe left the deadline in the past, clear it
+	_ = n.conn.SetWriteDeadline(time.Time{})
+
+	stop := n.bindWriteCancel(ctx)
+	defer stop()
+
 	if _, err := n.conn.Write(header[:]); err != nil {
-		return fmt.Errorf("mesh: write frame length %w", err)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return fmt.Errorf("mesh: send: %w", ctxErr)
+		}
+		return fmt.Errorf("mesh: write frame length: %w", err)
 	}
 	if _, err := n.conn.Write(body); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return fmt.Errorf("mesh: send: %w", ctxErr)
+		}
 		return fmt.Errorf("mesh: write frame body: %w", err)
 	}
 	return nil
 }
 
 // Recv reads the next length-prefixed JSON frame and decodes it into an envelope
-func (n *Node) Recv() (Envelope, error) {
+func (n *Node) Recv(ctx context.Context) (Envelope, error) {
+	_ = n.conn.SetReadDeadline(time.Time{})
+	stop := n.bindReadCancel(ctx)
+	defer stop()
 	var header [lengthPrefixBytes]byte
 	if _, err := io.ReadFull(n.conn, header[:]); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return Envelope{}, fmt.Errorf("mesh: recv: %w", ctxErr)
+		}
 		if errors.Is(err, io.EOF) {
 			return Envelope{}, io.EOF
 		}
@@ -77,6 +98,9 @@ func (n *Node) Recv() (Envelope, error) {
 	body := make([]byte, length)
 
 	if _, err := io.ReadFull(n.conn, body); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return Envelope{}, fmt.Errorf("mesh: recv: %w", ctxErr)
+		}
 		return Envelope{}, fmt.Errorf("mesh: read frame body: %w", err)
 	}
 
@@ -93,4 +117,36 @@ func (n *Node) Close() error {
 		return fmt.Errorf("mesh: close: %w", err)
 	}
 	return nil
+}
+
+// bindReadCancel spawns a watch goroutine that sets the conn's read deadline to time.Now()
+func (n *Node) bindReadCancel(ctx context.Context) func() {
+	if ctx == nil {
+		return func() {}
+	}
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = n.conn.SetReadDeadline(time.Now())
+		case <-done:
+		}
+	}()
+	return func() { close(done) }
+}
+
+// bindWriteCancel is the write-side of bindReadCancel. Writes use a separate watch so a cancelled send doesn't push
+func (n *Node) bindWriteCancel(ctx context.Context) func() {
+	if ctx == nil {
+		return func() {}
+	}
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = n.conn.SetWriteDeadline(time.Now())
+		case <-done:
+		}
+	}()
+	return func() { close(done) }
 }
