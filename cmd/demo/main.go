@@ -1,4 +1,6 @@
-// chat message to each other over in-memory
+// Command demo runs Goal 3 of meshop: two computers chat over a
+// Noise-XX-encrypted channel on top of TCP. One side runs with
+// --listen :PORT, the other with --dial host:PORT --peer PEERID
 package main
 
 import (
@@ -12,6 +14,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -21,49 +24,97 @@ import (
 const (
 	dialTimeout      = 10 * time.Second
 	keepAlivePeriod  = 30 * time.Second
-	helloTimeout     = 5 * time.Second
+	handshakeTimeout = 10 * time.Second
 	sendTimeout      = 5 * time.Second
 	reconnectMinWait = 1 * time.Second
 	reconnectMaxWait = 30 * time.Second
+	keyFileMode      = 0o600
+	keyFileDirMode   = 0o700
 )
 
 func main() {
-	listenAddr := flag.String("listen", "", "address to listen on, for example :9000")
+	listenAddr := flag.String("listen", "", "address to listen on, e.g. :9000")
 	dialAddr := flag.String("dial", "", "address to dial, e.g. 192.168.1.42:9000")
+	peerID := flag.String("peer", "", "expected remote PeerID (required with --dial)")
+	keyPath := flag.String("key", defaultKeyPath(), "path to static identity key file")
 	flag.Parse()
 
 	if (*listenAddr == "") == (*dialAddr == "") {
 		log.Fatal("specify exactly one of --listen or --dial")
 	}
-
-	localID, err := mesh.NewPeerID()
-	if err != nil {
-		log.Fatalf("peer id: %v", err)
+	if *dialAddr != "" && *peerID == "" {
+		log.Fatal("--dial requires --peer <PeerID>")
 	}
-	fmt.Printf("local peer id: %s\n", localID)
+
+	key, fresh, err := loadOrCreateKey(*keyPath)
+	if err != nil {
+		log.Fatalf("key: %v", err)
+	}
+	if fresh {
+		fmt.Printf("generated new identity at %s\n", *keyPath)
+	}
+	fmt.Printf("local peer id: %s\n", key.PeerID())
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	if *listenAddr != "" {
-		runListen(ctx, *listenAddr, localID)
+		runListen(ctx, *listenAddr, key)
 	} else {
-		runDial(ctx, *dialAddr, localID)
+		runDial(ctx, *dialAddr, mesh.PeerID(*peerID), key)
 	}
 }
 
-// runListen accepts one connection at a time. After session ends it foes back to Accept
+func defaultKeyPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "meshop.key"
+	}
+	return filepath.Join(home, ".meshop", "key")
+}
 
-func runListen(ctx context.Context, addr string, localID mesh.PeerID) {
+// loadOrCreateKey reads the StaticKey at path, generating and saving
+// a new one if the file does not exist.
+func loadOrCreateKey(path string) (mesh.StaticKey, bool, error) {
+	b, err := os.ReadFile(path)
+	if err == nil {
+		var k mesh.StaticKey
+		if err := k.UnmarshalBinary(b); err != nil {
+			return mesh.StaticKey{}, false, fmt.Errorf("decode %s: %w", path, err)
+		}
+		return k, false, nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return mesh.StaticKey{}, false, fmt.Errorf("read %s: %w", path, err)
+	}
+
+	if err := os.MkdirAll(filepath.Dir(path), keyFileDirMode); err != nil {
+		return mesh.StaticKey{}, false, fmt.Errorf("mkdir: %w", err)
+	}
+	k, err := mesh.GenerateKey()
+	if err != nil {
+		return mesh.StaticKey{}, false, fmt.Errorf("generate: %w", err)
+	}
+	out, err := k.MarshalBinary()
+	if err != nil {
+		return mesh.StaticKey{}, false, fmt.Errorf("marshal: %w", err)
+	}
+	if err := os.WriteFile(path, out, keyFileMode); err != nil {
+		return mesh.StaticKey{}, false, fmt.Errorf("write %s: %w", path, err)
+	}
+	return k, true, nil
+}
+
+// runListen accepts one connection at a time. After a session ends it
+// goes back to Accept.
+func runListen(ctx context.Context, addr string, key mesh.StaticKey) {
 	l, err := net.Listen("tcp", addr)
 	if err != nil {
 		log.Fatalf("listen %s: %v", addr, err)
 	}
-	defer func() {
-		_ = l.Close()
-	}()
+	defer func() { _ = l.Close() }()
 	fmt.Printf("listening on %s\n", l.Addr())
 
-	// Close the listener in Ctrl+C
 	go func() {
 		<-ctx.Done()
 		_ = l.Close()
@@ -78,9 +129,9 @@ func runListen(ctx context.Context, addr string, localID mesh.PeerID) {
 			log.Printf("Accept: %v", err)
 			return
 		}
-		fmt.Printf("\nPeer connected from %s\n", conn.RemoteAddr())
+		fmt.Printf("\npeer connected from %s\n", conn.RemoteAddr())
 		configureTCP(conn)
-		runSession(ctx, conn, localID)
+		runSession(ctx, conn, key, "")
 		if ctx.Err() != nil {
 			return
 		}
@@ -88,9 +139,9 @@ func runListen(ctx context.Context, addr string, localID mesh.PeerID) {
 	}
 }
 
-// runDial dials in a loop with exponential backoff
-
-func runDial(ctx context.Context, addr string, localID mesh.PeerID) {
+// runDial dials in a loop with exponential backoff, then runs one
+// authenticated session.
+func runDial(ctx context.Context, addr string, expected mesh.PeerID, key mesh.StaticKey) {
 	wait := reconnectMinWait
 	for ctx.Err() == nil {
 		dialer := &net.Dialer{Timeout: dialTimeout}
@@ -110,15 +161,13 @@ func runDial(ctx context.Context, addr string, localID mesh.PeerID) {
 			}
 			continue
 		}
-
 		wait = reconnectMinWait
 		fmt.Printf("\nconnected to %s\n", conn.RemoteAddr())
 		configureTCP(conn)
-		runSession(ctx, conn, localID)
+		runSession(ctx, conn, key, expected)
 	}
 }
 
-// configureTCP enables TCP keepalive on the connection
 func configureTCP(c net.Conn) {
 	t, ok := c.(*net.TCPConn)
 	if !ok {
@@ -132,41 +181,50 @@ func configureTCP(c net.Conn) {
 	}
 }
 
-// runSession runs full chat session over a connected conn
-func runSession(ctx context.Context, conn net.Conn, localID mesh.PeerID) {
-	node := mesh.NewNode(localID, conn)
-	defer func() { _ = node.Close() }()
-	sessionCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	remoteID, err := exchangeHello(sessionCtx, node, localID)
+// runSession runs the Noise handshake then a chat loop on top of the
+// resulting Session. expected is "" on the listener side.
+func runSession(ctx context.Context, conn net.Conn, key mesh.StaticKey, expected mesh.PeerID) {
+	hctx, hcancel := context.WithTimeout(ctx, handshakeTimeout)
+	session, err := mesh.Handshake(hctx, conn, mesh.HandshakeConfig{
+		StaticKey:      key,
+		ExpectedPeerID: expected,
+		Initiator:      expected != "",
+	})
+	hcancel()
 	if err != nil {
-		log.Printf("hello: %v", err)
+		log.Printf("handshake: %v", err)
+		_ = conn.Close()
 		return
 	}
-	fmt.Printf("peer id: %s\n", remoteID)
+	defer func() { _ = session.Close() }()
+
+	fmt.Printf("authenticated peer id: %s\n", session.RemoteID())
 	fmt.Print("> ")
+
+	sessionCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
 	recvErr := make(chan error, 1)
 	go func() {
 		for {
-			env, err := node.Recv(sessionCtx)
+			env, err := session.Recv(sessionCtx)
 			if err != nil {
 				recvErr <- err
 				return
 			}
-			// \r erases the prompt, then I need to show it again
 			fmt.Printf("\r<%s> %s\n> ", short(env.From), env.Payload)
 		}
 	}()
 
 	sendErr := make(chan error, 1)
 	go func() {
-		sendErr <- runStdinSend(sessionCtx, node, localID, remoteID)
+		sendErr <- runStdinSend(sessionCtx, session)
 	}()
+
 	select {
 	case err := <-recvErr:
 		if errors.Is(err, io.EOF) || errors.Is(err, context.Canceled) {
-			fmt.Println("\n peer disconnected")
+			fmt.Println("\npeer disconnected")
 		} else {
 			log.Printf("\nrecv: %v", err)
 		}
@@ -178,33 +236,8 @@ func runSession(ctx context.Context, conn net.Conn, localID mesh.PeerID) {
 	}
 }
 
-// exvhangeHello sends a hello envelope and reads one back, returning remote peer's ID
-func exchangeHello(ctx context.Context, n *mesh.Node, localID mesh.PeerID) (mesh.PeerID, error) {
-	hctx, cancel := context.WithTimeout(ctx, helloTimeout)
-	defer cancel()
-
-	out, err := mesh.NewEnvelope(localID, "", "hello", nil)
-	if err != nil {
-		return "", fmt.Errorf("build hello: %w", err)
-	}
-	if err := n.Send(hctx, out); err != nil {
-		return "", fmt.Errorf("send hello: %w", err)
-	}
-	in, err := n.Recv(hctx)
-	if err != nil {
-		return "", fmt.Errorf("recv hello: %w", err)
-	}
-	if in.Type != "hello" {
-		return "", fmt.Errorf("first envelope was %q, want %q", in.Type, "hello")
-	}
-	if in.From == "" {
-		return "", fmt.Errorf("hello has empty From field")
-	}
-	return in.From, nil
-}
-
 // runStdinSend reads lines from stdin and sends each as a chat envelope
-func runStdinSend(ctx context.Context, n *mesh.Node, localID, remoteID mesh.PeerID) error {
+func runStdinSend(ctx context.Context, s *mesh.Session) error {
 	scanner := bufio.NewScanner(os.Stdin)
 	for scanner.Scan() {
 		if ctx.Err() != nil {
@@ -212,25 +245,25 @@ func runStdinSend(ctx context.Context, n *mesh.Node, localID, remoteID mesh.Peer
 		}
 		text := scanner.Text()
 		if text == "" {
-			fmt.Printf("> ")
+			fmt.Print("> ")
 			continue
 		}
-		env, err := mesh.NewEnvelope(localID, remoteID, "chat", []byte(text))
+		env, err := mesh.NewEnvelope(s.LocalID(), s.RemoteID(), "chat", []byte(text))
 		if err != nil {
 			return fmt.Errorf("build envelope: %w", err)
 		}
 		sctx, scancel := context.WithTimeout(ctx, sendTimeout)
-		err = n.Send(sctx, env)
+		err = s.Send(sctx, env)
 		scancel()
 		if err != nil {
 			return fmt.Errorf("send: %w", err)
 		}
-		fmt.Printf("> ")
+		fmt.Print("> ")
 	}
 	return scanner.Err()
 }
 
-// short returns the first 8 chars of a PeerID, for compact display.
+// short returns the first 8 chars of a PeerID, for compact display
 func short(id mesh.PeerID) string {
 	if len(id) <= 8 {
 		return string(id)
