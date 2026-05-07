@@ -11,9 +11,23 @@ import (
 	"time"
 )
 
-// dialPair establishes a TCP connection to a fresh listener on
-// 127.0.0.1:0 and returns both ends. Both ends and the listener are
-// registered with t.Cleanup.
+func testPeerID(t *testing.T) PeerID {
+	t.Helper()
+	k, err := GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	return k.PeerID()
+}
+
+// sendUnderLockForTest writes env bypassing Session.Send's encryption.
+func (n *Node) sendUnderLockForTest(t testing.TB, env Envelope) error {
+	t.Helper()
+	n.sendMu.Lock()
+	defer n.sendMu.Unlock()
+	return n.sendUnderLock(context.Background(), env)
+}
+
 func dialPair(t *testing.T) (client, server net.Conn) {
 	t.Helper()
 
@@ -68,14 +82,8 @@ func TestNodeRoundTripTCP(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			aConn, bConn := dialPair(t)
 
-			aID, err := NewPeerID()
-			if err != nil {
-				t.Fatalf("NewPeerID a: %v", err)
-			}
-			bID, err := NewPeerID()
-			if err != nil {
-				t.Fatalf("NewPeerID b: %v", err)
-			}
+			aID := testPeerID(t)
+			bID := testPeerID(t)
 
 			alice := NewNode(aID, aConn)
 			bob := NewNode(bID, bConn)
@@ -133,10 +141,7 @@ func TestNodeRoundTripTCP(t *testing.T) {
 func TestRecvCancelByContext(t *testing.T) {
 	aConn, _ := dialPair(t)
 
-	aID, err := NewPeerID()
-	if err != nil {
-		t.Fatalf("NewPeerID: %v", err)
-	}
+	aID := testPeerID(t)
 	alice := NewNode(aID, aConn)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -170,14 +175,8 @@ func TestRecvCancelByContext(t *testing.T) {
 func TestRecvReturnsEOFOnPeerClose(t *testing.T) {
 	aConn, bConn := dialPair(t)
 
-	aID, err := NewPeerID()
-	if err != nil {
-		t.Fatalf("NewPeerID a: %v", err)
-	}
-	bID, err := NewPeerID()
-	if err != nil {
-		t.Fatalf("NewPeerID b: %v", err)
-	}
+	aID := testPeerID(t)
+	bID := testPeerID(t)
 
 	alice := NewNode(aID, aConn)
 	bob := NewNode(bID, bConn)
@@ -186,7 +185,7 @@ func TestRecvReturnsEOFOnPeerClose(t *testing.T) {
 		t.Fatalf("alice.Close: %v", err)
 	}
 
-	_, err = bob.Recv(context.Background())
+	_, err := bob.Recv(context.Background())
 	if !errors.Is(err, io.EOF) {
 		t.Fatalf("bob.Recv after peer close: got %v, want io.EOF", err)
 	}
