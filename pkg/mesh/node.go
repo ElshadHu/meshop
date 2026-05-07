@@ -209,3 +209,36 @@ func (n *Node) readFrame(ctx context.Context) ([]byte, error) {
 	}
 	return body, nil
 }
+
+// sendUnderLock writes env to the conn assuming sendMu is already held.
+// Used by Session.Send, which holds the lock to also serialise the
+// cipher-state nonce read/encrypt sequence
+func (n *Node) sendUnderLock(ctx context.Context, env Envelope) error {
+	body, err := json.Marshal(env)
+	if err != nil {
+		return fmt.Errorf("mesh: marshal envelope: %w", err)
+	}
+	if len(body) > MaxFrameBytes {
+		return fmt.Errorf("mesh: send: %w (size %d)", ErrFrameTooLarge, len(body))
+	}
+	var header [lengthPrefixBytes]byte
+	binary.BigEndian.PutUint32(header[:], uint32(len(body)))
+
+	_ = n.conn.SetWriteDeadline(time.Time{})
+	stop := n.bindWriteCancel(ctx)
+	defer stop()
+
+	if _, err := n.conn.Write(header[:]); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return fmt.Errorf("mesh: send: %w", ctxErr)
+		}
+		return fmt.Errorf("mesh: write frame length: %w", err)
+	}
+	if _, err := n.conn.Write(body); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return fmt.Errorf("mesh: send: %w", ctxErr)
+		}
+		return fmt.Errorf("mesh: write frame body: %w", err)
+	}
+	return nil
+}
