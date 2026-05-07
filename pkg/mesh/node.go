@@ -150,3 +150,62 @@ func (n *Node) bindWriteCancel(ctx context.Context) func() {
 	}()
 	return func() { close(done) }
 }
+
+// writeFrame writes a single length-prefixed frame to the conn
+func (n *Node) writeFrame(ctx context.Context, frame []byte) error {
+	if len(frame) > MaxFrameBytes {
+		return fmt.Errorf("mesh: writeFrame: %w (size %d)", ErrFrameTooLarge, len(frame))
+	}
+	var header [lengthPrefixBytes]byte
+	binary.BigEndian.PutUint32(header[:], uint32(len(frame)))
+	n.sendMu.Lock()
+	defer n.sendMu.Unlock()
+
+	_ = n.conn.SetWriteDeadline(time.Time{})
+	stop := n.bindWriteCancel(ctx)
+	defer stop()
+	if _, err := n.conn.Write(header[:]); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return fmt.Errorf("mesh: writeFrame: %w", ctxErr)
+		}
+		return fmt.Errorf("mesh: write frame length: %w", err)
+	}
+	if _, err := n.conn.Write(frame); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return fmt.Errorf("mesh: writeFrame: %w", ctxErr)
+		}
+		return fmt.Errorf("mesh: write frame body: %w", err)
+	}
+	return nil
+}
+
+// readFrame reads one length-prefixed frame and returns its body
+func (n *Node) readFrame(ctx context.Context) ([]byte, error) {
+	_ = n.conn.SetReadDeadline(time.Time{})
+	stop := n.bindReadCancel(ctx)
+	defer stop()
+
+	var header [lengthPrefixBytes]byte
+	if _, err := io.ReadFull(n.conn, header[:]); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, fmt.Errorf("mesh: readFrame: %w", ctxErr)
+		}
+		if errors.Is(err, io.EOF) {
+			return nil, io.EOF
+		}
+		return nil, fmt.Errorf("mesh: read frame length: %w", err)
+	}
+
+	length := binary.BigEndian.Uint32(header[:])
+	if length > MaxFrameBytes {
+		return nil, fmt.Errorf("mesh: readFrame: %w (size %d)", ErrFrameTooLarge, length)
+	}
+	body := make([]byte, length)
+	if _, err := io.ReadFull(n.conn, body); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, fmt.Errorf("mesh: readFrame: %w", ctxErr)
+		}
+		return nil, fmt.Errorf("mesh: read frame body: %w", err)
+	}
+	return body, nil
+}
