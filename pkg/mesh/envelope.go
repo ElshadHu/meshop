@@ -22,11 +22,15 @@ type Envelope struct {
 	// Payload is application data. encoding/json transmits []byte as
 	// base64 inside the JSON envelope
 	Payload []byte `json:"payload"`
+	// Nonce is the AEAD nonce. It is set by session
+	Nonce []byte `json:"nonce,omitempty"`
 }
 
 // envelopeIDBytes is the number of random bytes in ID
 const envelopeIDBytes = 16
 
+// NewEnvelope builds an Envelope with a fresh random ID and the current
+// local time. Nonce stays empty; Session populates it on Send
 func NewEnvelope(from, to PeerID, msgType string, payload []byte) (Envelope, error) {
 	b := make([]byte, envelopeIDBytes)
 	if _, err := rand.Read(b); err != nil {
