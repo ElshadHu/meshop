@@ -1,6 +1,6 @@
 // Command demo runs Goal 3 of meshop: two computers chat over a
 // Noise-XX-encrypted channel on top of TCP. One side runs with
-// --listen :PORT, the other with --dial host:PORT --peer PEERID
+// --listen :PORT, the other with --dial host:PORT --peer PEERID.
 package main
 
 import (
@@ -10,11 +10,12 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -32,36 +33,78 @@ const (
 	keyFileDirMode   = 0o700
 )
 
+// App owns the cross-cutting state of one running demo peer.
+type App struct {
+	key    mesh.StaticKey
+	logger *slog.Logger
+}
+
 func main() {
 	listenAddr := flag.String("listen", "", "address to listen on, e.g. :9000")
 	dialAddr := flag.String("dial", "", "address to dial, e.g. 192.168.1.42:9000")
 	peerID := flag.String("peer", "", "expected remote PeerID (required with --dial)")
 	keyPath := flag.String("key", defaultKeyPath(), "path to static identity key file")
+	logLevel := flag.String("log-level", "info", "log level: debug, info, warn, error")
+	flag.CommandLine.SetOutput(os.Stderr)
 	flag.Parse()
 
 	if (*listenAddr == "") == (*dialAddr == "") {
-		log.Fatal("specify exactly one of --listen or --dial")
+		usage("specify exactly one of --listen or --dial")
 	}
 	if *dialAddr != "" && *peerID == "" {
-		log.Fatal("--dial requires --peer <PeerID>")
+		usage("--dial requires --peer <PeerID>")
 	}
+
+	level, err := parseLogLevel(*logLevel)
+	if err != nil {
+		usage(err.Error())
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 
 	key, fresh, err := loadOrCreateKey(*keyPath)
 	if err != nil {
-		log.Fatalf("key: %v", err)
+		logger.Error("key load failed", "path", *keyPath, "err", err)
+		os.Exit(1)
 	}
 	if fresh {
-		fmt.Printf("generated new identity at %s\n", *keyPath)
+		logger.Info("identity created", "path", *keyPath)
 	}
-	fmt.Printf("local peer id: %s\n", key.PeerID())
+	logger.Info("local peer id", "id", key.PeerID())
+
+	app := &App{key: key, logger: logger}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	if *listenAddr != "" {
-		runListen(ctx, *listenAddr, key)
+		app.listen(ctx, *listenAddr)
 	} else {
-		runDial(ctx, *dialAddr, mesh.PeerID(*peerID), key)
+		app.dial(ctx, *dialAddr, mesh.PeerID(*peerID))
+	}
+}
+
+// usage writes a short error and the flag usage to stderr and exits 2.
+// Used for "you invoked the binary wrong" cases, before the slog logger
+// exists.
+func usage(msg string) {
+	fmt.Fprintln(os.Stderr, msg)
+	flag.Usage()
+	os.Exit(2)
+}
+
+// parseLogLevel turns "debug"/"info"/"warn"/"error" into a slog.Level.
+func parseLogLevel(s string) (slog.Level, error) {
+	switch strings.ToLower(s) {
+	case "debug":
+		return slog.LevelDebug, nil
+	case "info":
+		return slog.LevelInfo, nil
+	case "warn", "warning":
+		return slog.LevelWarn, nil
+	case "error":
+		return slog.LevelError, nil
+	default:
+		return 0, fmt.Errorf("unknown --log-level %q", s)
 	}
 }
 
@@ -73,8 +116,8 @@ func defaultKeyPath() string {
 	return filepath.Join(home, ".meshop", "key")
 }
 
-// loadOrCreateKey reads the StaticKey at path, generating and saving
-// a new one if the file does not exist.
+// loadOrCreateKey reads the StaticKey at path, generating and saving a
+// new one if the file does not exist.
 func loadOrCreateKey(path string) (mesh.StaticKey, bool, error) {
 	b, err := os.ReadFile(path)
 	if err == nil {
@@ -105,15 +148,16 @@ func loadOrCreateKey(path string) (mesh.StaticKey, bool, error) {
 	return k, true, nil
 }
 
-// runListen accepts one connection at a time. After a session ends it
-// goes back to Accept.
-func runListen(ctx context.Context, addr string, key mesh.StaticKey) {
+// listen accepts one connection at a time. After a session ends it goes
+// back to Accept.
+func (a *App) listen(ctx context.Context, addr string) {
 	l, err := net.Listen("tcp", addr)
 	if err != nil {
-		log.Fatalf("listen %s: %v", addr, err)
+		a.logger.Error("listen failed", "addr", addr, "err", err)
+		os.Exit(1)
 	}
 	defer func() { _ = l.Close() }()
-	fmt.Printf("listening on %s\n", l.Addr())
+	a.logger.Info("listening", "addr", l.Addr().String())
 
 	go func() {
 		<-ctx.Done()
@@ -126,28 +170,28 @@ func runListen(ctx context.Context, addr string, key mesh.StaticKey) {
 			if ctx.Err() != nil {
 				return
 			}
-			log.Printf("Accept: %v", err)
+			a.logger.Warn("accept failed", "err", err)
 			return
 		}
-		fmt.Printf("\npeer connected from %s\n", conn.RemoteAddr())
-		configureTCP(conn)
-		runSession(ctx, conn, key, "")
+		a.logger.Info("peer connected", "remote", conn.RemoteAddr().String())
+		configureTCP(conn, a.logger)
+		a.runSession(ctx, conn, "")
 		if ctx.Err() != nil {
 			return
 		}
-		fmt.Println("waiting for next peer...")
+		a.logger.Info("waiting for next peer")
 	}
 }
 
-// runDial dials in a loop with exponential backoff, then runs one
+// dial dials in a loop with exponential backoff, then runs one
 // authenticated session.
-func runDial(ctx context.Context, addr string, expected mesh.PeerID, key mesh.StaticKey) {
+func (a *App) dial(ctx context.Context, addr string, expected mesh.PeerID) {
 	wait := reconnectMinWait
 	for ctx.Err() == nil {
 		dialer := &net.Dialer{Timeout: dialTimeout}
 		conn, err := dialer.DialContext(ctx, "tcp", addr)
 		if err != nil {
-			log.Printf("dial %s: %v (retry in %s)", addr, err, wait)
+			a.logger.Warn("dial failed, retrying", "addr", addr, "err", err, "retry_in", wait)
 			select {
 			case <-time.After(wait):
 			case <-ctx.Done():
@@ -162,43 +206,46 @@ func runDial(ctx context.Context, addr string, expected mesh.PeerID, key mesh.St
 			continue
 		}
 		wait = reconnectMinWait
-		fmt.Printf("\nconnected to %s\n", conn.RemoteAddr())
-		configureTCP(conn)
-		runSession(ctx, conn, key, expected)
+		a.logger.Info("connected", "remote", conn.RemoteAddr().String())
+		configureTCP(conn, a.logger)
+		a.runSession(ctx, conn, expected)
 	}
 }
 
-func configureTCP(c net.Conn) {
+// configureTCP enables TCP keepalive on conn. Failures are logged and
+// ignored; the session still runs without keepalive
+func configureTCP(c net.Conn, logger *slog.Logger) {
 	t, ok := c.(*net.TCPConn)
 	if !ok {
 		return
 	}
 	if err := t.SetKeepAlive(true); err != nil {
-		log.Printf("keepalive: %v", err)
+		logger.Warn("keepalive set failed", "err", err)
 	}
 	if err := t.SetKeepAlivePeriod(keepAlivePeriod); err != nil {
-		log.Printf("keepalive period: %v", err)
+		logger.Warn("keepalive period set failed", "err", err)
 	}
 }
 
 // runSession runs the Noise handshake then a chat loop on top of the
 // resulting Session. expected is "" on the listener side.
-func runSession(ctx context.Context, conn net.Conn, key mesh.StaticKey, expected mesh.PeerID) {
+func (a *App) runSession(ctx context.Context, conn net.Conn, expected mesh.PeerID) {
 	hctx, hcancel := context.WithTimeout(ctx, handshakeTimeout)
 	session, err := mesh.Handshake(hctx, conn, mesh.HandshakeConfig{
-		StaticKey:      key,
+		StaticKey:      a.key,
 		ExpectedPeerID: expected,
 		Initiator:      expected != "",
 	})
 	hcancel()
 	if err != nil {
-		log.Printf("handshake: %v", err)
+		a.logger.Error("handshake failed", "err", err)
 		_ = conn.Close()
 		return
 	}
 	defer func() { _ = session.Close() }()
 
-	fmt.Printf("authenticated peer id: %s\n", session.RemoteID())
+	sessLog := a.logger.With("remote", session.RemoteID())
+	sessLog.Info("authenticated")
 	fmt.Print("> ")
 
 	sessionCtx, cancel := context.WithCancel(ctx)
@@ -218,26 +265,26 @@ func runSession(ctx context.Context, conn net.Conn, key mesh.StaticKey, expected
 
 	sendErr := make(chan error, 1)
 	go func() {
-		sendErr <- runStdinSend(sessionCtx, session)
+		sendErr <- a.runStdinSend(sessionCtx, session)
 	}()
 
 	select {
 	case err := <-recvErr:
 		if errors.Is(err, io.EOF) || errors.Is(err, context.Canceled) {
-			fmt.Println("\npeer disconnected")
+			sessLog.Info("peer disconnected")
 		} else {
-			log.Printf("\nrecv: %v", err)
+			sessLog.Error("recv failed", "err", err)
 		}
 	case err := <-sendErr:
 		if err != nil && !errors.Is(err, context.Canceled) {
-			log.Printf("send: %v", err)
+			sessLog.Error("send failed", "err", err)
 		}
 	case <-sessionCtx.Done():
 	}
 }
 
 // runStdinSend reads lines from stdin and sends each as a chat envelope
-func runStdinSend(ctx context.Context, s *mesh.Session) error {
+func (a *App) runStdinSend(ctx context.Context, s *mesh.Session) error {
 	scanner := bufio.NewScanner(os.Stdin)
 	for scanner.Scan() {
 		if ctx.Err() != nil {
