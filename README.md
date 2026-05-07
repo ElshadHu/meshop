@@ -32,7 +32,7 @@ as later goals land. Nothing is stable yet, and no version has been tagged.
 |---|-----------------------------------------------------------------------|
 | + | Two parts of one Go program send a message to each other.             |
 | + | Two computers on the same network send messages to each other.        |
-|   | All messages are encrypted end-to-end.                                |
+| + | All messages are encrypted end-to-end.                                |
 |   | Three or more devices, with messages relayed through intermediate peers. |
 |   | Identity, contacts, and message history persist across restarts.      |
 |   | Android library over Wi-Fi.                                           |
