@@ -1,7 +1,6 @@
 package mesh
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"errors"
@@ -134,7 +133,7 @@ func runResponder(ctx context.Context, n *Node, hs *noise.HandshakeState) (send,
 	if err != nil {
 		return nil, nil, fmt.Errorf("mesh: handshake msg3 parse: %w", err)
 	}
-	if !bytes.Equal(out, nil) {
+	if len(out) > 0 {
 		return nil, nil, fmt.Errorf("mesh: handshake msg3: unexpected payload (%d bytes)", len(out))
 	}
 	if cs1 == nil || cs2 == nil {
