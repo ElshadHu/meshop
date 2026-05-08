@@ -45,7 +45,7 @@ func (s *Session) Send(ctx context.Context, env Envelope) error {
 		return fmt.Errorf("mesh: session send: encrypt: %w", err)
 	}
 	env.Payload = cipherText
-	return s.node.sendUnderLock(ctx, env)
+	return s.node.sendEnvelopeLocked(ctx, env)
 }
 
 // Recv reads the next envelope from the wire, verifies the wire

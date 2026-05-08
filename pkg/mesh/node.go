@@ -45,34 +45,9 @@ func (n *Node) Send(ctx context.Context, env Envelope) error {
 	if err != nil {
 		return fmt.Errorf("mesh: marshal envelope: %w", err)
 	}
-	if len(body) > MaxFrameBytes {
-		return fmt.Errorf("mesh: send: %w (size %d)", ErrFrameTooLarge, len(body))
-	}
-
-	var header [lengthPrefixBytes]byte
-	binary.BigEndian.PutUint32(header[:], uint32(len(body)))
 	n.sendMu.Lock()
-	defer n.sendMu.Unlock()
-
-	// A previous cancelled call maybe left the deadline in the past, clear it
-	_ = n.conn.SetWriteDeadline(time.Time{})
-
-	stop := n.bindWriteCancel(ctx)
-	defer stop()
-
-	if _, err := n.conn.Write(header[:]); err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return fmt.Errorf("mesh: send: %w", ctxErr)
-		}
-		return fmt.Errorf("mesh: write frame length: %w", err)
-	}
-	if _, err := n.conn.Write(body); err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return fmt.Errorf("mesh: send: %w", ctxErr)
-		}
-		return fmt.Errorf("mesh: write frame body: %w", err)
-	}
-	return nil
+	n.sendMu.Unlock()
+	return n.writeFrameLocked(ctx, body)
 }
 
 // Recv reads the next length-prefixed JSON frame and decodes it into an envelope
@@ -119,6 +94,32 @@ func (n *Node) Close() error {
 	return nil
 }
 
+// writeFrameLocked writes body as a length-prefixed frame
+func (n *Node) writeFrameLocked(ctx context.Context, body []byte) error {
+	if len(body) > MaxFrameBytes {
+		return fmt.Errorf("mesh: write frame: %w (size %d)", ErrFrameTooLarge, len(body))
+	}
+	var header [lengthPrefixBytes]byte
+	binary.BigEndian.PutUint32(header[:], uint32(len(body)))
+	// A previous one could leave the deadline in the past
+	_ = n.conn.SetWriteDeadline(time.Time{})
+	stop := n.bindWriteCancel(ctx)
+	defer stop()
+	if _, err := n.conn.Write(header[:]); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return fmt.Errorf("mesh: write frame: %w", ctxErr)
+		}
+		return fmt.Errorf("mesh: write frame length: %w", err)
+	}
+	if _, err := n.conn.Write(body); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return fmt.Errorf("mesh: write frame: %w", ctxErr)
+		}
+		return fmt.Errorf("mesh: write frame body: %w", err)
+	}
+	return nil
+}
+
 // bindReadCancel spawns a watch goroutine that sets the conn's read deadline to time.Now()
 func (n *Node) bindReadCancel(ctx context.Context) func() {
 	if ctx == nil {
@@ -153,30 +154,9 @@ func (n *Node) bindWriteCancel(ctx context.Context) func() {
 
 // writeFrame writes a single length-prefixed frame to the conn
 func (n *Node) writeFrame(ctx context.Context, frame []byte) error {
-	if len(frame) > MaxFrameBytes {
-		return fmt.Errorf("mesh: writeFrame: %w (size %d)", ErrFrameTooLarge, len(frame))
-	}
-	var header [lengthPrefixBytes]byte
-	binary.BigEndian.PutUint32(header[:], uint32(len(frame)))
 	n.sendMu.Lock()
 	defer n.sendMu.Unlock()
-
-	_ = n.conn.SetWriteDeadline(time.Time{})
-	stop := n.bindWriteCancel(ctx)
-	defer stop()
-	if _, err := n.conn.Write(header[:]); err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return fmt.Errorf("mesh: writeFrame: %w", ctxErr)
-		}
-		return fmt.Errorf("mesh: write frame length: %w", err)
-	}
-	if _, err := n.conn.Write(frame); err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return fmt.Errorf("mesh: writeFrame: %w", ctxErr)
-		}
-		return fmt.Errorf("mesh: write frame body: %w", err)
-	}
-	return nil
+	return n.writeFrameLocked(ctx, frame)
 }
 
 // readFrame reads one length-prefixed frame and returns its body
@@ -210,35 +190,13 @@ func (n *Node) readFrame(ctx context.Context) ([]byte, error) {
 	return body, nil
 }
 
-// sendUnderLock writes env to the conn assuming sendMu is already held.
+// sendEnvelopeLocked writes env to the conn assuming sendMu is already held.
 // Used by Session.Send, which holds the lock to also serialise the
 // cipher-state nonce read/encrypt sequence
-func (n *Node) sendUnderLock(ctx context.Context, env Envelope) error {
+func (n *Node) sendEnvelopeLocked(ctx context.Context, env Envelope) error {
 	body, err := json.Marshal(env)
 	if err != nil {
 		return fmt.Errorf("mesh: marshal envelope: %w", err)
 	}
-	if len(body) > MaxFrameBytes {
-		return fmt.Errorf("mesh: send: %w (size %d)", ErrFrameTooLarge, len(body))
-	}
-	var header [lengthPrefixBytes]byte
-	binary.BigEndian.PutUint32(header[:], uint32(len(body)))
-
-	_ = n.conn.SetWriteDeadline(time.Time{})
-	stop := n.bindWriteCancel(ctx)
-	defer stop()
-
-	if _, err := n.conn.Write(header[:]); err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return fmt.Errorf("mesh: send: %w", ctxErr)
-		}
-		return fmt.Errorf("mesh: write frame length: %w", err)
-	}
-	if _, err := n.conn.Write(body); err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return fmt.Errorf("mesh: send: %w", ctxErr)
-		}
-		return fmt.Errorf("mesh: write frame body: %w", err)
-	}
-	return nil
+	return n.writeFrameLocked(ctx, body)
 }

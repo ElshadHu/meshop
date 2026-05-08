@@ -25,7 +25,7 @@ func (n *Node) sendUnderLockForTest(t testing.TB, env Envelope) error {
 	t.Helper()
 	n.sendMu.Lock()
 	defer n.sendMu.Unlock()
-	return n.sendUnderLock(context.Background(), env)
+	return n.sendEnvelopeLocked(context.Background(), env)
 }
 
 func dialPair(t *testing.T) (client, server net.Conn) {
