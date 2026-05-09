@@ -80,7 +80,7 @@ func (s *Session) Recv(ctx context.Context) (Envelope, error) {
 // The Payload field is excluded (it is the AEAD plaintext) every
 // other field is bound, including the Nonce
 func envelopeAAD(env Envelope) []byte {
-	out := make([]byte, 0, 64+len(env.Payload)/4)
+	out := make([]byte, 0, 256)
 	out = appendLP(out, []byte(env.ID))
 	out = appendLP(out, []byte(env.From))
 	out = appendLP(out, []byte(env.To))
