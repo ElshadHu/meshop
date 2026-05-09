@@ -55,6 +55,10 @@ func main() {
 		usage("--dial requires --peer <PeerID>")
 	}
 
+	if *listenAddr != "" && *peerID != "" {
+		usage("--peer is only valid with --dial")
+	}
+
 	level, err := parseLogLevel(*logLevel)
 	if err != nil {
 		usage(err.Error())
