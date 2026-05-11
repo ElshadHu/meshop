@@ -7,6 +7,11 @@ import (
 	"time"
 )
 
+const (
+	envelopeIDBytes = 16
+	defaultTTL      = 8
+)
+
 // Envelope wraps a single message exchanged between two peers.
 type Envelope struct {
 	// ID is a message identifier
@@ -24,10 +29,9 @@ type Envelope struct {
 	Payload []byte `json:"payload"`
 	// Nonce is the AEAD nonce. It is set by session
 	Nonce []byte `json:"nonce,omitempty"`
+	// TTL to show the time to live
+	TTL uint8 `json:"ttl"`
 }
-
-// envelopeIDBytes is the number of random bytes in ID
-const envelopeIDBytes = 16
 
 // NewEnvelope builds an Envelope with a fresh random ID and the current
 // local time. Nonce stays empty; Session populates it on Send
@@ -44,5 +48,6 @@ func NewEnvelope(from, to PeerID, msgType string, payload []byte) (Envelope, err
 		Type:      msgType,
 		Timestamp: time.Now(),
 		Payload:   payload,
+		TTL:       defaultTTL,
 	}, nil
 }
