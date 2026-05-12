@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 
 	"github.com/flynn/noise"
@@ -28,8 +29,8 @@ type HandshakeConfig struct {
 }
 
 // Handshake runs Noise_XX_25519_ChaChaPoly_SHA256 over conn and
-// returns a Session bound to that connection
-func Handshake(ctx context.Context, conn net.Conn, cfg HandshakeConfig) (*Session, error) {
+// returns a Link with the per-link Session attached
+func Handshake(ctx context.Context, conn net.Conn, cfg HandshakeConfig, logger *slog.Logger) (*Link, error) {
 	if conn == nil {
 		return nil, fmt.Errorf("mesh: handshake: nil conn")
 	}
@@ -44,13 +45,13 @@ func Handshake(ctx context.Context, conn net.Conn, cfg HandshakeConfig) (*Sessio
 	if err != nil {
 		return nil, fmt.Errorf("mesh: handshake init: %w", err)
 	}
-	// Use a temporary Node to drive raw framed I/O during the handshake
-	tmp := NewNode(cfg.StaticKey.PeerID(), conn)
+	// Build a Link with no remoteID/session yet
+	link := NewLink(cfg.StaticKey.PeerID(), "", conn, nil, logger)
 	var sendCS, recvCS *noise.CipherState
 	if cfg.Initiator {
-		sendCS, recvCS, err = runInitiator(ctx, tmp, hs)
+		sendCS, recvCS, err = runInitiator(ctx, link, hs)
 	} else {
-		sendCS, recvCS, err = runResponder(ctx, tmp, hs)
+		sendCS, recvCS, err = runResponder(ctx, link, hs)
 	}
 	if err != nil {
 		return nil, err
@@ -66,26 +67,27 @@ func Handshake(ctx context.Context, conn net.Conn, cfg HandshakeConfig) (*Sessio
 		return nil, fmt.Errorf("mesh: handshake: %w (expected %s, got %s)",
 			ErrPeerIDMismatch, cfg.ExpectedPeerID, remoteID)
 	}
-	return &Session{
-		node:     tmp,
+	link.remoteID = remoteID
+	link.session = &Session{
 		sendCS:   sendCS,
 		recvCS:   recvCS,
 		remoteID: remoteID,
-	}, nil
+	}
+	return link, nil
 }
 
 // runInitiator drives the dialer side of Noise XX
 // After 3 msg both sides hold a pair of CipherStates.
-func runInitiator(ctx context.Context, n *Node, hs *noise.HandshakeState) (send, recv *noise.CipherState, err error) {
+func runInitiator(ctx context.Context, l *Link, hs *noise.HandshakeState) (send, recv *noise.CipherState, err error) {
 	out1, _, _, err := hs.WriteMessage(nil, nil)
 	if err != nil {
 		return nil, nil, fmt.Errorf("mesh: handshake msg1 build: %w", err)
 	}
-	if err := n.writeFrame(ctx, out1); err != nil {
+	if err := l.writeFrame(ctx, out1); err != nil {
 		return nil, nil, fmt.Errorf("mesh: handshake msg1 send: %w", err)
 	}
 
-	in2, err := n.readFrame(ctx)
+	in2, err := l.readFrame(ctx)
 	if err != nil {
 		return nil, nil, fmt.Errorf("mesh: handshake msg2 recv: %w", err)
 	}
@@ -100,16 +102,15 @@ func runInitiator(ctx context.Context, n *Node, hs *noise.HandshakeState) (send,
 	if cs1 == nil || cs2 == nil {
 		return nil, nil, fmt.Errorf("mesh: handshake msg3: cipher states not produced")
 	}
-	if err := n.writeFrame(ctx, out3); err != nil {
+	if err := l.writeFrame(ctx, out3); err != nil {
 		return nil, nil, fmt.Errorf("mesh: handshake msg3 send: %w", err)
 	}
 	return cs1, cs2, nil
 }
 
 // runResponder drives the listening side of Noise XX
-func runResponder(ctx context.Context, n *Node, hs *noise.HandshakeState) (send, recv *noise.CipherState, err error) {
-	// <- e
-	in1, err := n.readFrame(ctx)
+func runResponder(ctx context.Context, l *Link, hs *noise.HandshakeState) (send, recv *noise.CipherState, err error) {
+	in1, err := l.readFrame(ctx)
 	if err != nil {
 		return nil, nil, fmt.Errorf("mesh: handshake msg1 recv: %w", err)
 	}
@@ -121,11 +122,11 @@ func runResponder(ctx context.Context, n *Node, hs *noise.HandshakeState) (send,
 	if err != nil {
 		return nil, nil, fmt.Errorf("mesh: handshake msg2 build: %w", err)
 	}
-	if err := n.writeFrame(ctx, out2); err != nil {
+	if err := l.writeFrame(ctx, out2); err != nil {
 		return nil, nil, fmt.Errorf("mesh: handshake msg2 send: %w", err)
 	}
 
-	in3, err := n.readFrame(ctx)
+	in3, err := l.readFrame(ctx)
 	if err != nil {
 		return nil, nil, fmt.Errorf("mesh: handshake msg3 recv: %w", err)
 	}
