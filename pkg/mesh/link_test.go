@@ -20,22 +20,20 @@ func testPeerID(t *testing.T) PeerID {
 	return k.PeerID()
 }
 
-// sendUnderLockForTest writes env bypassing Session.Send's encryption.
-func (n *Node) sendUnderLockForTest(t testing.TB, env Envelope) error {
+// sendUnderLockForTest writes env bypassing Session encryption
+func (l *Link) sendUnderLockForTest(t testing.TB, env Envelope) error {
 	t.Helper()
-	n.sendMu.Lock()
-	defer n.sendMu.Unlock()
-	return n.sendEnvelopeLocked(context.Background(), env)
+	return l.SendEnvelope(context.Background(), env)
 }
 
 func dialPair(t *testing.T) (client, server net.Conn) {
 	t.Helper()
 
-	l, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	t.Cleanup(func() { _ = l.Close() })
+	t.Cleanup(func() { _ = ln.Close() })
 
 	type acceptResult struct {
 		conn net.Conn
@@ -43,7 +41,7 @@ func dialPair(t *testing.T) (client, server net.Conn) {
 	}
 	accepted := make(chan acceptResult, 1)
 	go func() {
-		c, err := l.Accept()
+		c, err := ln.Accept()
 		accepted <- acceptResult{c, err}
 	}()
 
@@ -51,7 +49,7 @@ func dialPair(t *testing.T) (client, server net.Conn) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	client, err = dialer.DialContext(ctx, "tcp", l.Addr().String())
+	client, err = dialer.DialContext(ctx, "tcp", ln.Addr().String())
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -66,9 +64,9 @@ func dialPair(t *testing.T) (client, server net.Conn) {
 	return client, ar.conn
 }
 
-// TestNodeRoundTripTCP sends an Envelope from one Node to another over a
+// TestLinkRoundTripTCP sends an Envelope from one Link to another over a
 // real loopback TCP connection and verifies it arrives intact
-func TestNodeRoundTripTCP(t *testing.T) {
+func TestLinkRoundTripTCP(t *testing.T) {
 	cases := []struct {
 		name    string
 		payload []byte
@@ -85,8 +83,8 @@ func TestNodeRoundTripTCP(t *testing.T) {
 			aID := testPeerID(t)
 			bID := testPeerID(t)
 
-			alice := NewNode(aID, aConn)
-			bob := NewNode(bID, bConn)
+			alice := NewLink(aID, bID, aConn, nil, nil)
+			bob := NewLink(bID, aID, bConn, nil, nil)
 
 			sent, err := NewEnvelope(aID, bID, "chat", tc.payload)
 			if err != nil {
@@ -101,16 +99,16 @@ func TestNodeRoundTripTCP(t *testing.T) {
 			var sendErr error
 			go func() {
 				defer wg.Done()
-				sendErr = alice.Send(ctx, sent)
+				sendErr = alice.SendEnvelope(ctx, sent)
 			}()
 
-			got, err := bob.Recv(ctx)
+			got, err := bob.ReceiveEnvelope(ctx)
 			if err != nil {
-				t.Fatalf("bob.Recv: %v", err)
+				t.Fatalf("bob.ReceiveEnvelope: %v", err)
 			}
 			wg.Wait()
 			if sendErr != nil {
-				t.Fatalf("alice.Send: %v", sendErr)
+				t.Fatalf("alice.SendEnvelope: %v", sendErr)
 			}
 
 			if got.ID != sent.ID {
@@ -135,14 +133,13 @@ func TestNodeRoundTripTCP(t *testing.T) {
 	}
 }
 
-// TestRecvCancelByContext verifies that a Recv call blocked on the
-// network unblocks when its context is cancelled, and the returned
-// error wraps context.Canceled.
-func TestRecvCancelByContext(t *testing.T) {
+// TestReceiveCancelByContext verifies that a ReceiveEnvelope call blocked
+// on the network unblocks when its context is cancelled
+func TestReceiveCancelByContext(t *testing.T) {
 	aConn, _ := dialPair(t)
 
 	aID := testPeerID(t)
-	alice := NewNode(aID, aConn)
+	alice := NewLink(aID, "", aConn, nil, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -152,41 +149,40 @@ func TestRecvCancelByContext(t *testing.T) {
 	}
 	done := make(chan recvResult, 1)
 	go func() {
-		env, err := alice.Recv(ctx)
+		env, err := alice.ReceiveEnvelope(ctx)
 		done <- recvResult{env, err}
 	}()
 
-	// Give Recv time to actually park on the read. (I might change later)
 	time.Sleep(50 * time.Millisecond)
 	cancel()
 
 	select {
 	case r := <-done:
 		if !errors.Is(r.err, context.Canceled) {
-			t.Fatalf("Recv after cancel: got %v, want context.Canceled wrapped", r.err)
+			t.Fatalf("ReceiveEnvelope after cancel: got %v, want context.Canceled wrapped", r.err)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("Recv did not return within 1s of ctx cancellation")
+		t.Fatal("ReceiveEnvelope did not return within 1s of ctx cancellation")
 	}
 }
 
-// TestRecvReturnsEOFOnPeerClose verifies that Recv returns io.EOF when
-// the peer closes its side of the TCP connection at a frame boundary.
-func TestRecvReturnsEOFOnPeerClose(t *testing.T) {
+// TestReceiveReturnsEOFOnPeerClose verifies that ReceiveEnvelope returns
+// io.EOF when the peer closes its side of the TCP connection
+func TestReceiveReturnsEOFOnPeerClose(t *testing.T) {
 	aConn, bConn := dialPair(t)
 
 	aID := testPeerID(t)
 	bID := testPeerID(t)
 
-	alice := NewNode(aID, aConn)
-	bob := NewNode(bID, bConn)
+	alice := NewLink(aID, bID, aConn, nil, nil)
+	bob := NewLink(bID, aID, bConn, nil, nil)
 
 	if err := alice.Close(); err != nil {
 		t.Fatalf("alice.Close: %v", err)
 	}
 
-	_, err := bob.Recv(context.Background())
+	_, err := bob.ReceiveEnvelope(context.Background())
 	if !errors.Is(err, io.EOF) {
-		t.Fatalf("bob.Recv after peer close: got %v, want io.EOF", err)
+		t.Fatalf("bob.ReceiveEnvelope after peer close: got %v, want io.EOF", err)
 	}
 }
