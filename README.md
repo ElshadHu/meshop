@@ -33,7 +33,7 @@ as later goals land. Nothing is stable yet, and no version has been tagged.
 | + | Two parts of one Go program send a message to each other.             |
 | + | Two computers on the same network send messages to each other.        |
 | + | All messages are encrypted end-to-end.                                |
-|   | Three or more devices, with messages relayed through intermediate peers. |
+| + | Three or more devices, with messages relayed through intermediate peers. |
 |   | Identity, contacts, and message history persist across restarts.      |
 |   | Android library over Wi-Fi.                                           |
 |   | Android over Bluetooth, no Wi-Fi or internet needed.                  |
@@ -46,9 +46,83 @@ as later goals land. Nothing is stable yet, and no version has been tagged.
 ## Build and run
 
 ```
-go build ./...
-go vet ./...
-go run ./cmd/demo
+make build      # compile everything
+make test       # run unit tests
+make vet        # static checks
+make fmt        # format code
+make demo       # build the demo binary
+```
+
+## Try the chat demo
+
+The demo program is `cmd/demo`. Each node has:
+
+- a **key file** — its identity. Same key file = same PeerID.
+- a **PeerID** — long hex string printed on the first log line.
+- optional `--listen :PORT` — accept neighbors.
+- optional `--connect host:port=PEERID` — dial a neighbor.
+- optional `--target PEERID` — who you want to chat with. Without this, you can only receive.
+
+The `Makefile` wraps these with three helpers: `alice`, `bob`, `carol`. They use
+key files in `/tmp/` so PeerIDs stay the same between runs.
+
+### Two-node chat (Alice ↔ Bob)
+
+Open two terminals.
+
+1. **Terminal 1** — start Alice once to get her PeerID:
+   ```
+   make alice
+   ```
+   Copy the `id=...` value (call it `ALICE_ID`). Press Ctrl+C.
+
+2. **Terminal 2** — start Bob to get his PeerID:
+   ```
+   make bob PEER=<ALICE_ID>
+   ```
+   Copy Bob's `id=...` (call it `BOB_ID`). Press Ctrl+C.
+
+3. **Restart both with `TARGET`** so you can type:
+   ```
+   # Terminal 1
+   make alice TARGET=<BOB_ID>
+
+   # Terminal 2
+   make bob PEER=<ALICE_ID> TARGET=<ALICE_ID>
+   ```
+
+Type a message in either terminal and press Enter. It shows up on the other side as `<peer_id_short> message`.
+
+### Three-node chat with relay (Alice <-> Bob <-> Carol)
+
+Carol has **no direct link** to Alice. Bob relays.
+
+1. Get Carol's ID first:
+   ```
+   make carol PEER=<BOB_ID>
+   ```
+   Copy `CAROL_ID`. Press Ctrl+C.
+
+2. Run all three:
+   ```
+   # Terminal 1
+   make alice TARGET=<CAROL_ID>
+
+   # Terminal 2
+   make bob PEER=<ALICE_ID>
+
+   # Terminal 3
+   make carol PEER=<BOB_ID> TARGET=<ALICE_ID>
+   ```
+
+Type in Alice -> message reaches Carol through Bob. Type in Carol -> reaches Alice the same way. Bob only forwards.
+
+To prove the relay matters: press Ctrl+C on Bob. Alice and Carol stop hearing each other. Restart Bob and it works again.
+
+### Reset
+
+```
+make clean-keys   # delete /tmp/{alice,bob,carol}.key — new PeerIDs next run
 ```
 
 ## Project layout
