@@ -1,6 +1,3 @@
-// Command demo runs Goal 3 of meshop: two computers chat over a
-// Noise-XX-encrypted channel on top of TCP. One side runs with
-// --listen :PORT, the other with --dial host:PORT --peer PEERID.
 package main
 
 import (

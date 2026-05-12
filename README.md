@@ -131,3 +131,7 @@ make clean-keys   # delete /tmp/{alice,bob,carol}.key — new PeerIDs next run
 cmd/demo/         demo program
 pkg/mesh/         the library
 ```
+
+## More details
+
+If you want to see the architecture, the wire format, the design decisions, and the diagrams, visit the [wiki](https://github.com/ElshadHu/meshop/wiki).
