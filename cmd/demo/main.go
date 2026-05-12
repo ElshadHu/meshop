@@ -235,19 +235,20 @@ func configureTCP(c net.Conn, logger *slog.Logger) {
 // resulting Session. expected is "" on the listener side.
 func (a *App) runSession(ctx context.Context, conn net.Conn, expected mesh.PeerID) {
 	hctx, hcancel := context.WithTimeout(ctx, handshakeTimeout)
-	session, err := mesh.Handshake(hctx, conn, mesh.HandshakeConfig{
+	link, err := mesh.Handshake(hctx, conn, mesh.HandshakeConfig{
 		StaticKey:      a.key,
 		ExpectedPeerID: expected,
 		Initiator:      expected != "",
-	})
+	}, a.logger)
 	hcancel()
 	if err != nil {
 		a.logger.Error("handshake failed", "err", err)
 		_ = conn.Close()
 		return
 	}
-	defer func() { _ = session.Close() }()
+	defer func() { _ = link.Close() }()
 
+	session := link.Session()
 	sessLog := a.logger.With("remote", session.RemoteID())
 	sessLog.Info("authenticated")
 	fmt.Print("> ")
@@ -258,18 +259,23 @@ func (a *App) runSession(ctx context.Context, conn net.Conn, expected mesh.PeerI
 	recvErr := make(chan error, 1)
 	go func() {
 		for {
-			env, err := session.Recv(sessionCtx)
+			env, err := link.ReceiveEnvelope(sessionCtx)
 			if err != nil {
 				recvErr <- err
 				return
 			}
-			fmt.Printf("\r<%s> %s\n> ", short(env.From), env.Payload)
+			plain, err := session.Decrypt(env)
+			if err != nil {
+				recvErr <- err
+				return
+			}
+			fmt.Printf("\r<%s> %s\n> ", short(plain.From), plain.Payload)
 		}
 	}()
 
 	sendErr := make(chan error, 1)
 	go func() {
-		sendErr <- a.runStdinSend(sessionCtx, session)
+		sendErr <- a.runStdinSend(sessionCtx, link)
 	}()
 
 	select {
@@ -288,8 +294,9 @@ func (a *App) runSession(ctx context.Context, conn net.Conn, expected mesh.PeerI
 }
 
 // runStdinSend reads lines from stdin and sends each as a chat envelope
-func (a *App) runStdinSend(ctx context.Context, s *mesh.Session) error {
+func (a *App) runStdinSend(ctx context.Context, link *mesh.Link) error {
 	scanner := bufio.NewScanner(os.Stdin)
+	s := link.Session()
 	for scanner.Scan() {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -299,12 +306,16 @@ func (a *App) runStdinSend(ctx context.Context, s *mesh.Session) error {
 			fmt.Print("> ")
 			continue
 		}
-		env, err := mesh.NewEnvelope(s.LocalID(), s.RemoteID(), "chat", []byte(text))
+		env, err := mesh.NewEnvelope(link.LocalID(), s.RemoteID(), "chat", []byte(text))
 		if err != nil {
 			return fmt.Errorf("build envelope: %w", err)
 		}
+		enc, err := s.Encrypt(env)
+		if err != nil {
+			return fmt.Errorf("encrypt: %w", err)
+		}
 		sctx, scancel := context.WithTimeout(ctx, sendTimeout)
-		err = s.Send(sctx, env)
+		err = link.SendEnvelope(sctx, enc)
 		scancel()
 		if err != nil {
 			return fmt.Errorf("send: %w", err)
