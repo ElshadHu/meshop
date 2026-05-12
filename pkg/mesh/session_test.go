@@ -9,8 +9,15 @@ import (
 	"time"
 )
 
-// handshakePair returns two Sessions over a real loopback TCP pair.
-func handshakePair(t *testing.T) (initiator, responder *Session) {
+// sessionPair holds one side of a handshaken pair: wire Node + crypto Session
+type sessionPair struct {
+	id   PeerID
+	node *Node
+	sess *Session
+}
+
+// handshakePair returns two sides of a Noise XX handshake over a real loopback TCP pair
+func handshakePair(t *testing.T) (alice, bob sessionPair) {
 	t.Helper()
 
 	clientConn, serverConn := dialPair(t)
@@ -25,8 +32,9 @@ func handshakePair(t *testing.T) (initiator, responder *Session) {
 	}
 
 	type result struct {
-		s   *Session
-		err error
+		node *Node
+		sess *Session
+		err  error
 	}
 	cdone := make(chan result, 1)
 	sdone := make(chan result, 1)
@@ -35,19 +43,19 @@ func handshakePair(t *testing.T) (initiator, responder *Session) {
 	defer cancel()
 
 	go func() {
-		s, err := Handshake(ctx, clientConn, HandshakeConfig{
+		n, s, err := Handshake(ctx, clientConn, HandshakeConfig{
 			StaticKey:      clientKey,
 			ExpectedPeerID: serverKey.PeerID(),
 			Initiator:      true,
 		})
-		cdone <- result{s, err}
+		cdone <- result{n, s, err}
 	}()
 	go func() {
-		s, err := Handshake(ctx, serverConn, HandshakeConfig{
+		n, s, err := Handshake(ctx, serverConn, HandshakeConfig{
 			StaticKey: serverKey,
 			Initiator: false,
 		})
-		sdone <- result{s, err}
+		sdone <- result{n, s, err}
 	}()
 
 	cr := <-cdone
@@ -60,10 +68,29 @@ func handshakePair(t *testing.T) (initiator, responder *Session) {
 	}
 
 	t.Cleanup(func() {
-		_ = cr.s.Close()
-		_ = sr.s.Close()
+		_ = cr.node.Close()
+		_ = sr.node.Close()
 	})
-	return cr.s, sr.s
+	return sessionPair{id: clientKey.PeerID(), node: cr.node, sess: cr.sess},
+		sessionPair{id: serverKey.PeerID(), node: sr.node, sess: sr.sess}
+}
+
+// sendChat encrypts env with sender's session and writes it on sender's node
+func sendChat(ctx context.Context, sp sessionPair, env Envelope) error {
+	enc, err := sp.sess.Encrypt(env)
+	if err != nil {
+		return err
+	}
+	return sp.node.Send(ctx, enc)
+}
+
+// recvChat reads the next frame from receiver's node and decrypts it
+func recvChat(ctx context.Context, sp sessionPair) (Envelope, error) {
+	env, err := sp.node.Recv(ctx)
+	if err != nil {
+		return Envelope{}, err
+	}
+	return sp.sess.Decrypt(env)
 }
 
 func TestSessionRoundTrip(t *testing.T) {
@@ -80,7 +107,7 @@ func TestSessionRoundTrip(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			alice, bob := handshakePair(t)
 
-			env, err := NewEnvelope(alice.LocalID(), bob.LocalID(), "chat", tc.payload)
+			env, err := NewEnvelope(alice.id, bob.id, "chat", tc.payload)
 			if err != nil {
 				t.Fatalf("NewEnvelope: %v", err)
 			}
@@ -93,23 +120,23 @@ func TestSessionRoundTrip(t *testing.T) {
 			var sendErr error
 			go func() {
 				defer wg.Done()
-				sendErr = alice.Send(ctx, env)
+				sendErr = sendChat(ctx, alice, env)
 			}()
 
-			got, err := bob.Recv(ctx)
+			got, err := recvChat(ctx, bob)
 			if err != nil {
-				t.Fatalf("bob.Recv: %v", err)
+				t.Fatalf("recvChat: %v", err)
 			}
 			wg.Wait()
 			if sendErr != nil {
-				t.Fatalf("alice.Send: %v", sendErr)
+				t.Fatalf("sendChat: %v", sendErr)
 			}
 
 			if !bytes.Equal(got.Payload, tc.payload) {
 				t.Errorf("Payload: got %v want %v", got.Payload, tc.payload)
 			}
-			if got.From != alice.LocalID() {
-				t.Errorf("From: got %q want %q", got.From, alice.LocalID())
+			if got.From != alice.id {
+				t.Errorf("From: got %q want %q", got.From, alice.id)
 			}
 			if len(got.Nonce) != nonceBytes {
 				t.Errorf("Nonce length: got %d want %d", len(got.Nonce), nonceBytes)
@@ -130,7 +157,7 @@ func TestHandshakeRejectsWrongPeerID(t *testing.T) {
 
 	cerr := make(chan error, 1)
 	go func() {
-		_, err := Handshake(ctx, clientConn, HandshakeConfig{
+		_, _, err := Handshake(ctx, clientConn, HandshakeConfig{
 			StaticKey:      clientKey,
 			ExpectedPeerID: wrongKey.PeerID(),
 			Initiator:      true,
@@ -138,7 +165,7 @@ func TestHandshakeRejectsWrongPeerID(t *testing.T) {
 		cerr <- err
 	}()
 	go func() {
-		_, _ = Handshake(ctx, serverConn, HandshakeConfig{
+		_, _, _ = Handshake(ctx, serverConn, HandshakeConfig{
 			StaticKey: serverKey,
 			Initiator: false,
 		})
@@ -153,10 +180,10 @@ func TestHandshakeRejectsWrongPeerID(t *testing.T) {
 func TestSessionRejectsTamperedCiphertext(t *testing.T) {
 	alice, bob := handshakePair(t)
 
-	env, _ := NewEnvelope(alice.LocalID(), bob.LocalID(), "chat", []byte("secret"))
-	env.Nonce = encodeNonce(alice.sendCS.Nonce())
+	env, _ := NewEnvelope(alice.id, bob.id, "chat", []byte("secret"))
+	env.Nonce = encodeNonce(alice.sess.sendCS.Nonce())
 	aad := envelopeAAD(env)
-	ct, err := alice.sendCS.Encrypt(nil, aad, env.Payload)
+	ct, err := alice.sess.sendCS.Encrypt(nil, aad, env.Payload)
 	if err != nil {
 		t.Fatalf("encrypt: %v", err)
 	}
@@ -172,18 +199,18 @@ func TestSessionRejectsTamperedCiphertext(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel()
-	if _, err := bob.Recv(ctx); err == nil {
-		t.Fatal("Recv accepted tampered ciphertext")
+	if _, err := recvChat(ctx, bob); err == nil {
+		t.Fatal("recvChat accepted tampered ciphertext")
 	}
 }
 
 func TestSessionRejectsTamperedHeader(t *testing.T) {
 	alice, bob := handshakePair(t)
 
-	env, _ := NewEnvelope(alice.LocalID(), bob.LocalID(), "chat", []byte("secret"))
-	env.Nonce = encodeNonce(alice.sendCS.Nonce())
+	env, _ := NewEnvelope(alice.id, bob.id, "chat", []byte("secret"))
+	env.Nonce = encodeNonce(alice.sess.sendCS.Nonce())
 	aad := envelopeAAD(env)
-	ct, err := alice.sendCS.Encrypt(nil, aad, env.Payload)
+	ct, err := alice.sess.sendCS.Encrypt(nil, aad, env.Payload)
 	if err != nil {
 		t.Fatalf("encrypt: %v", err)
 	}
@@ -196,23 +223,23 @@ func TestSessionRejectsTamperedHeader(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel()
-	if _, err := bob.Recv(ctx); err == nil {
-		t.Fatal("Recv accepted tampered header")
+	if _, err := recvChat(ctx, bob); err == nil {
+		t.Fatal("recvChat accepted tampered header")
 	}
 }
 
 func TestSessionRejectsReplay(t *testing.T) {
 	alice, bob := handshakePair(t)
 
-	env, _ := NewEnvelope(alice.LocalID(), bob.LocalID(), "chat", []byte("once"))
+	env, _ := NewEnvelope(alice.id, bob.id, "chat", []byte("once"))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	if err := alice.Send(ctx, env); err != nil {
+	if err := sendChat(ctx, alice, env); err != nil {
 		t.Fatalf("first send: %v", err)
 	}
-	if _, err := bob.Recv(ctx); err != nil {
+	if _, err := recvChat(ctx, bob); err != nil {
 		t.Fatalf("first recv: %v", err)
 	}
 
@@ -222,8 +249,7 @@ func TestSessionRejectsReplay(t *testing.T) {
 	if err := alice.node.sendUnderLockForTest(t, bad); err != nil {
 		t.Fatalf("raw send: %v", err)
 	}
-	if _, err := bob.Recv(ctx); err == nil {
-		t.Fatal("Recv accepted stale nonce")
+	if _, err := recvChat(ctx, bob); err == nil {
+		t.Fatal("recvChat accepted stale nonce")
 	}
 }
-

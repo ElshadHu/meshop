@@ -1,9 +1,9 @@
 package mesh
 
 import (
-	"context"
 	"encoding/binary"
 	"fmt"
+	"sync"
 
 	"github.com/flynn/noise"
 )
@@ -11,74 +11,63 @@ import (
 // nonceBytes is the AEAD nonce length
 const nonceBytes = 12
 
-// Session is an authenticated, encrypted channel between two peers
-// Concurrency contract:
-//   - Send is safe to call from multiple goroutines simultaneously.
-//   - Recv is NOT safe for concurrent use; call from a single goroutine.
-//   - Close may be called from any goroutine.
+// Session is an authenticated, encrypted channel between two peers.
+// It holds cipher states only; it owns no I/O. Encrypt and Decrypt are
+// safe to call from multiple goroutines.
 type Session struct {
-	node     *Node
 	sendCS   *noise.CipherState
 	recvCS   *noise.CipherState
 	remoteID PeerID
+	mu       sync.Mutex
 }
 
 // RemoteID returns the PeerID of the remote peer
 func (s *Session) RemoteID() PeerID { return s.remoteID }
 
-// LocalID returns this peer's PeerID
-func (s *Session) LocalID() PeerID { return s.node.ID() }
-
-// Close tears down the session and closes the underlying connection
-func (s *Session) Close() error { return s.node.Close() }
-
-// Send encrypts env.Payload, populates env.Nonce, and writes the
-// resulting envelope to the wire
-func (s *Session) Send(ctx context.Context, env Envelope) error {
-	s.node.sendMu.Lock()
-	defer s.node.sendMu.Unlock()
-	nonceCounter := s.sendCS.Nonce()
-	env.Nonce = encodeNonce(nonceCounter)
+// Encrypt sets env.Nonce from the send counter, computes AAD over the
+// routing fields, encrypts env.Payload, and returns the ready-to-send
+// envelope
+func (s *Session) Encrypt(env Envelope) (Envelope, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	env.Nonce = encodeNonce(s.sendCS.Nonce())
 	aad := envelopeAAD(env)
-	cipherText, err := s.sendCS.Encrypt(nil, aad, env.Payload)
+	ct, err := s.sendCS.Encrypt(nil, aad, env.Payload)
 	if err != nil {
-		return fmt.Errorf("mesh: session send: encrypt: %w", err)
+		return Envelope{}, fmt.Errorf("mesh: session encrypt: %w", err)
 	}
-	env.Payload = cipherText
-	return s.node.sendEnvelopeLocked(ctx, env)
+	env.Payload = ct
+	return env, nil
 }
 
-// Recv reads the next envelope from the wire, verifies the wire
-// nonce matches the next expected counter
-func (s *Session) Recv(ctx context.Context) (Envelope, error) {
-	env, err := s.node.Recv(ctx)
-	if err != nil {
-		return Envelope{}, err
-	}
-
+// Decrypt verifies env.Nonce against the recv counter, computes AAD,
+// and decrypts env.Payload. Returns the envelope with plaintext payload
+func (s *Session) Decrypt(env Envelope) (Envelope, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if len(env.Nonce) != nonceBytes {
-		return Envelope{}, fmt.Errorf("mesh: session recv: bad nonce length %d", len(env.Nonce))
+		return Envelope{}, fmt.Errorf("mesh: session decrypt: bad nonce length %d", len(env.Nonce))
 	}
 	got, err := decodeNonce(env.Nonce)
 	if err != nil {
-		return Envelope{}, fmt.Errorf("mesh: session recv: %w", err)
+		return Envelope{}, fmt.Errorf("mesh: session decrypt: %w", err)
 	}
 	want := s.recvCS.Nonce()
 	if got != want {
-		return Envelope{}, fmt.Errorf("mesh: session recv: nonce mismatch (got %d, want %d)", got, want)
+		return Envelope{}, fmt.Errorf("mesh: session decrypt: nonce mismatch (got %d, want %d)", got, want)
 	}
 	aad := envelopeAAD(env)
-	plaintext, err := s.recvCS.Decrypt(nil, aad, env.Payload)
+	pt, err := s.recvCS.Decrypt(nil, aad, env.Payload)
 	if err != nil {
-		return Envelope{}, fmt.Errorf("mesh: session recv: decrypt: %w", err)
+		return Envelope{}, fmt.Errorf("mesh: session decrypt: %w", err)
 	}
-	env.Payload = plaintext
+	env.Payload = pt
 	return env, nil
 }
 
 // envelopeAAD returns deterministic associated-data bytes for env.
-// The Payload field is excluded (it is the AEAD plaintext) every
-// other field is bound, including the Nonce
+// The Payload field is excluded (it is the AEAD plaintext). TTL is
+// excluded too (it changes at every hop). Every other field is bound
 func envelopeAAD(env Envelope) []byte {
 	out := make([]byte, 0, 256)
 	out = appendLP(out, []byte(env.ID))
