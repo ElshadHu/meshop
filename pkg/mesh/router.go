@@ -110,7 +110,11 @@ func (r *Router) acceptLoop(l net.Listener) {
 		if err != nil {
 			return
 		}
-		go r.acceptConn(conn)
+		r.wg.Add(1)
+		go func() {
+			defer r.wg.Done()
+			r.acceptConn(conn)
+		}()
 	}
 }
 
