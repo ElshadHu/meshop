@@ -30,6 +30,11 @@ func (s *Session) RemoteID() PeerID { return s.remoteID }
 func (s *Session) Encrypt(env Envelope) (Envelope, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.encryptLocked(env)
+}
+
+// encryptLocked is Encrypt without taking s.mu Caller must hold in current structure (might change)
+func (s *Session) encryptLocked(env Envelope) (Envelope, error) {
 	env.Nonce = encodeNonce(s.sendCS.Nonce())
 	aad := envelopeAAD(env)
 	ct, err := s.sendCS.Encrypt(nil, aad, env.Payload)
