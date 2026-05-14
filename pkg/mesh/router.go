@@ -268,7 +268,9 @@ func (r *Router) Send(ctx context.Context, to PeerID, msgType string, payload []
 	if err != nil {
 		return err
 	}
-	enc, err := sess.Encrypt(env)
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	enc, err := sess.encryptLocked(env)
 	if err != nil {
 		return err
 	}
@@ -504,4 +506,20 @@ func (r *Router) Recv(ctx context.Context) (Envelope, error) {
 	case <-r.ctx.Done():
 		return Envelope{}, ErrRouterClosed
 	}
+}
+
+// attachConn is for tests that wire two Routers with net.Pipe. It
+// runs the link-level handshake on conn and adds the resulting Link.
+func (r *Router) attachConn(ctx context.Context, conn net.Conn, initiator bool, expected PeerID) error {
+	link, err := Handshake(ctx, conn, HandshakeConfig{
+		StaticKey:      r.key,
+		ExpectedPeerID: expected,
+		Initiator:      initiator,
+	}, r.logger)
+	if err != nil {
+		_ = conn.Close()
+		return err
+	}
+	r.addLink(link)
+	return nil
 }
