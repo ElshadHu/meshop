@@ -108,6 +108,9 @@ func (r *Router) acceptLoop(l net.Listener) {
 	for {
 		conn, err := l.Accept()
 		if err != nil {
+			if r.ctx.Err() == nil {
+				r.logger.Warn("accept failed", "err", err)
+			}
 			return
 		}
 		r.wg.Add(1)
