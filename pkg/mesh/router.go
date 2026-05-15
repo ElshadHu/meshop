@@ -30,6 +30,10 @@ const (
 // ErrRouterClosed is returned by Recv after Close is called
 var ErrRouterClosed = errors.New("mesh: router closed")
 
+// errHandshakeCollisionLost is sent to our own Send when the other side
+// also started a handshake at the same time and has a bigger PeerID.
+var errHandshakeCollisionLost = errors.New("mesh: handshake collision: peer wins")
+
 type pendingHandshake struct {
 	remoteID  PeerID
 	initiator bool
@@ -44,15 +48,16 @@ type handshakeResult struct {
 
 // Router is the top-level mesh peer. It owns one identity, many Links (direct neighbors)
 type Router struct {
-	key      StaticKey
-	localID  PeerID
-	links    map[PeerID]*Link
-	sessions map[PeerID]*Session
-	pending  map[PeerID]*pendingHandshake
-	dedup    *dedupCache
-	inbox    chan Envelope
-	mu       sync.Mutex
-	logger   *slog.Logger
+	key            StaticKey
+	localID        PeerID
+	links          map[PeerID]*Link
+	sessions       map[PeerID]*Session
+	pending        map[PeerID]*pendingHandshake
+	sessionWaiters map[PeerID][]chan struct{}
+	dedup          *dedupCache
+	inbox          chan Envelope
+	mu             sync.Mutex
+	logger         *slog.Logger
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -65,16 +70,17 @@ func NewRouter(key StaticKey, logger *slog.Logger) *Router {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Router{
-		key:      key,
-		localID:  key.PeerID(),
-		links:    make(map[PeerID]*Link),
-		sessions: make(map[PeerID]*Session),
-		pending:  make(map[PeerID]*pendingHandshake),
-		dedup:    newDedupCache(defaultDedupSize),
-		inbox:    make(chan Envelope, defaultInboxSize),
-		ctx:      ctx,
-		cancel:   cancel,
-		logger:   logger,
+		key:            key,
+		localID:        key.PeerID(),
+		links:          make(map[PeerID]*Link),
+		sessions:       make(map[PeerID]*Session),
+		pending:        make(map[PeerID]*pendingHandshake),
+		sessionWaiters: make(map[PeerID][]chan struct{}),
+		dedup:          newDedupCache(defaultDedupSize),
+		inbox:          make(chan Envelope, defaultInboxSize),
+		ctx:            ctx,
+		cancel:         cancel,
+		logger:         logger,
 	}
 }
 
@@ -329,6 +335,9 @@ func (r *Router) startHandshakeOverRelay(ctx context.Context, to PeerID) (*Sessi
 	select {
 	case res := <-pending.done:
 		r.deletePending(to, pending)
+		if errors.Is(res.err, errHandshakeCollisionLost) {
+			return r.waitForSession(hsCtx, to)
+		}
 		if res.err != nil {
 			return nil, res.err
 		}
@@ -348,6 +357,42 @@ func (r *Router) deletePending(to PeerID, pending *pendingHandshake) {
 		delete(r.pending, to)
 	}
 	r.mu.Unlock()
+}
+
+// waitForSession blocks until a session for "to" is installed.
+// We call it after we lose a handshake collision
+func (r *Router) waitForSession(ctx context.Context, to PeerID) (*Session, error) {
+	r.mu.Lock()
+	if sess := r.sessions[to]; sess != nil {
+		r.mu.Unlock()
+		return sess, nil
+	}
+	ch := make(chan struct{})
+	r.sessionWaiters[to] = append(r.sessionWaiters[to], ch)
+	r.mu.Unlock()
+	select {
+	case <-ch:
+		r.mu.Lock()
+		sess := r.sessions[to]
+		r.mu.Unlock()
+		if sess == nil {
+			return nil, fmt.Errorf("mesh: session waiter woke with no session")
+		}
+		return sess, nil
+	case <-ctx.Done():
+		return nil, fmt.Errorf("mesh: timeout waiting for session after collision:%w", ctx.Err())
+	case <-r.ctx.Done():
+		return nil, ErrRouterClosed
+	}
+}
+
+// notifySessionWaitersLocked wakes every goroutine waiting for a
+// session with id
+func (r *Router) notifySessionWaitersLocked(id PeerID) {
+	for _, ch := range r.sessionWaiters[id] {
+		close(ch)
+	}
+	delete(r.sessionWaiters, id)
 }
 
 // Close shuts down the router. Closes all links and stops the accept
@@ -387,10 +432,27 @@ func (r *Router) handleHandshakeMsg1(env Envelope) {
 		r.logger.Debug("already have session, ignoring msg1", "from", env.From)
 		return
 	}
-	if r.pending[env.From] != nil {
-		r.mu.Unlock()
-		r.logger.Warn("handshake collision, ignoring msg1", "from", env.From)
-		return
+	if existing := r.pending[env.From]; existing != nil {
+		if !existing.initiator {
+			// We already built a responder for this peer.
+			// This is a copy of the same msg1 from the flood.
+			r.mu.Unlock()
+			r.logger.Debug("duplicate msg1, ignoring", "from", env.From)
+			return
+		}
+		// Both sides started a handshake at the same time.
+		// The peer with the bigger PeerID keeps the initiator role.
+		if r.localID > env.From {
+			// We win. Drop the peer's msg1, keep our own state.
+			r.mu.Unlock()
+			r.logger.Debug("collision won, ignoring inbound msg1", "from", env.From, "local", r.localID)
+			return
+		}
+		// We lose. Tell our own Send to stop waiting, then drop
+		// our initiator state. We will answer the peer's msg1 below.
+		existing.done <- handshakeResult{err: errHandshakeCollisionLost}
+		delete(r.pending, env.From)
+		r.logger.Debug("collision lost, becoming responder", "from", env.From, "local", r.localID)
 	}
 	r.mu.Unlock()
 	hs, err := noise.NewHandshakeState(noise.Config{
@@ -472,6 +534,8 @@ func (r *Router) handleHandshakeMsg2(env Envelope) {
 	session := &Session{sendCS: cs1, recvCS: cs2, remoteID: env.From}
 	r.mu.Lock()
 	r.sessions[env.From] = session
+	delete(r.pending, env.From)
+	r.notifySessionWaitersLocked(env.From)
 	r.mu.Unlock()
 	pending.done <- handshakeResult{session: session}
 }
@@ -501,6 +565,7 @@ func (r *Router) handleHandshakeMsg3(env Envelope) {
 	r.mu.Lock()
 	r.sessions[env.From] = session
 	delete(r.pending, env.From)
+	r.notifySessionWaitersLocked(env.From)
 	r.mu.Unlock()
 }
 
