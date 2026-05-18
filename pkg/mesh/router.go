@@ -10,6 +10,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/flynn/noise"
@@ -56,6 +57,7 @@ type Router struct {
 	sessionWaiters map[PeerID][]chan struct{}
 	dedup          *dedupCache
 	inbox          chan Envelope
+	inboxDropped   atomic.Uint64
 	mu             sync.Mutex
 	logger         *slog.Logger
 
@@ -244,7 +246,15 @@ func (r *Router) deliverLocal(env Envelope) {
 	select {
 	case r.inbox <- plain:
 	case <-r.ctx.Done():
+	default:
+		r.inboxDropped.Add(1)
+		r.logger.Warn("inbox full, dropping envelope", "from", env.From, "type", env.Type, "dropped_total", r.inboxDropped.Load())
 	}
+}
+
+// Dropped returns the total number of inbound envelopes dropped because the inbox is full
+func (r *Router) Dropped() uint64 {
+	return r.inboxDropped.Load()
 }
 
 func (r *Router) forwardToAllExcept(origin PeerID, env Envelope) {
