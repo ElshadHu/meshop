@@ -33,3 +33,9 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# gomobile bind output
+/android/libs/*.aar
+/android/libs/*.jar
+/android/app/libs/*.aar
+/android/app/libs/*.jar
