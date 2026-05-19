@@ -1,4 +1,4 @@
-.PHONY: build demo test vet fmt tidy clean alice bob carol clean-keys
+.PHONY: build demo test vet fmt tidy clean alice bob carol clean-keys aar aar-clean aar-install
 
 build:
 	go build ./...
@@ -46,3 +46,17 @@ carol:
 
 clean-keys:
 	rm -f /tmp/alice.key /tmp/bob.key /tmp/carol.key
+
+AAR_OUT := android/libs/libmeshop.aar
+
+aar:
+	@mkdir -p $(dir $(AAR_OUT))
+	gomobile bind -target=android -androidapi 26 \
+		-o $(AAR_OUT) ./mobile/libmeshop
+
+aar-clean:
+	rm -f $(AAR_OUT)
+
+aar-install: aar
+	@echo "AAR built at $(AAR_OUT)"
+	@echo "Open android/ in Android Studio and run the app"
