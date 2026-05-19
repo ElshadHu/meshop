@@ -26,22 +26,16 @@ format, the on-disk layout, and the package layout itself will all move
 as later goals land. Nothing is stable yet, and no version has been tagged.
 
 
-## Roadmap
+## What works today
 
-|   | Goal                                                                  |
-|---|-----------------------------------------------------------------------|
-| + | Two parts of one Go program send a message to each other.             |
-| + | Two computers on the same network send messages to each other.        |
-| + | All messages are encrypted end-to-end.                                |
-| + | Three or more devices, with messages relayed through intermediate peers. |
-|   | Identity, contacts, and message history persist across restarts.      |
-|   | Android library over Wi-Fi.                                           |
-|   | Android over Bluetooth, no Wi-Fi or internet needed.                  |
-|   | iPhone.                                                               |
-|   | Web browser.                                                          |
-|   | Developer documentation.                                              |
-|   | Public API and external review.                                |
-|   | 1.0 release.                                                          |
+- Direct chat between two nodes on the same network, over TCP.
+- End-to-end encryption with the Noise XX pattern (Curve25519, ChaCha20-Poly1305, SHA-256).
+- Mesh relay: a node forwards encrypted messages for peers it does not talk to directly, with TTL and duplicate suppression.
+- On-demand handshake over the relay when the sender and receiver have no direct link.
+- Handshake-collision resolution when both peers start a handshake at the same time (bigger PeerID keeps the initiator role).
+- Identity persists across restarts: the demo writes the static key to a file on first run and loads it on the next, so a node keeps the same PeerID.
+- Inbox backpressure: when the receive buffer is full, the dropped count is exposed via `Router.Dropped()` and logged.
+- CI runs `go vet`, `go build`, and `go test ./...` on every push.
 
 ## Build and run
 
