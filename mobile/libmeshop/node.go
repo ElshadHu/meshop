@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 
 	"github.com/ElshadHu/meshop/pkg/mesh"
+	_ "golang.org/x/mobile/bind"
 )
 
 // Logger is implemented on the Java side and called from Go
