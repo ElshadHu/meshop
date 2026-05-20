@@ -39,3 +39,33 @@ jobs:
 
       - name: Build
         run: make build
+
+  bind-android:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: true
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install gomobile
+        run: go install golang.org/x/mobile/cmd/gomobile@v0.0.0-20260519152538-35b1249819c3
+
+      - name: gomobile init
+        run: gomobile init
+
+      - name: Bind test
+        run: gomobile bind -target=android -androidapi 26 -o /tmp/libmeshop.aar ./mobile/libmeshop
