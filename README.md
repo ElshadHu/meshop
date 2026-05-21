@@ -35,7 +35,8 @@ as later goals land. Nothing is stable yet, and no version has been tagged.
 - Handshake-collision resolution when both peers start a handshake at the same time (bigger PeerID keeps the initiator role).
 - Identity persists across restarts: the demo writes the static key to a file on first run and loads it on the next, so a node keeps the same PeerID.
 - Inbox backpressure: when the receive buffer is full, the dropped count is exposed via `Router.Dropped()` and logged.
-- CI runs `go vet`, `go build`, and `go test ./...` on every push.
+- Android library binding: the Go code compiles to an `.aar` via `gomobile bind` (`make aar`). Android apps embed it and talk to a small `Node` facade in `mobile/libmeshop`. The mesh code in `pkg/mesh` is untouched.
+- CI runs `go vet`, `go build`, and `go test ./...` on every push, plus a `gomobile bind` smoke test that fails if the Android binding stops compiling.
 
 ## Build and run
 
@@ -45,6 +46,7 @@ make test       # run unit tests
 make vet        # static checks
 make fmt        # format code
 make demo       # build the demo binary
+make aar        # build the Android .aar (needs gomobile + Android NDK)
 ```
 
 ## Try the chat demo
@@ -124,6 +126,8 @@ make clean-keys   # delete /tmp/{alice,bob,carol}.key — new PeerIDs next run
 ```
 cmd/demo/         demo program
 pkg/mesh/         the library
+mobile/libmeshop/ Android binding facade (gomobile bind target)
+android/          Android sample app + built .aar
 ```
 
 ## More details
