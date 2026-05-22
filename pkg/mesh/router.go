@@ -2,7 +2,6 @@ package mesh
 
 import (
 	"context"
-	"crypto/rand"
 	"errors"
 	"fmt"
 	"io"
@@ -303,14 +302,7 @@ func (r *Router) Send(ctx context.Context, to PeerID, msgType string, payload []
 }
 
 func (r *Router) startHandshakeOverRelay(ctx context.Context, to PeerID) (*Session, error) {
-	hs, err := noise.NewHandshakeState(noise.Config{
-		CipherSuite:   defaultCipherSuite(),
-		Random:        rand.Reader,
-		Pattern:       noise.HandshakeXX,
-		Initiator:     true,
-		Prologue:      prologue,
-		StaticKeypair: r.key.dh,
-	})
+	hs, err := newHandshakeState(r.key, true)
 	if err != nil {
 		return nil, fmt.Errorf("mesh: relay handshake init: %w", err)
 	}
@@ -465,14 +457,7 @@ func (r *Router) handleHandshakeMsg1(env Envelope) {
 		r.logger.Debug("collision lost, becoming responder", "from", env.From, "local", r.localID)
 	}
 	r.mu.Unlock()
-	hs, err := noise.NewHandshakeState(noise.Config{
-		CipherSuite:   defaultCipherSuite(),
-		Random:        rand.Reader,
-		Pattern:       noise.HandshakeXX,
-		Initiator:     false,
-		Prologue:      prologue,
-		StaticKeypair: r.key.dh,
-	})
+	hs, err := newHandshakeState(r.key, false)
 
 	if err != nil {
 		r.logger.Warn("responder init failed", "err", err)
