@@ -34,14 +34,7 @@ func Handshake(ctx context.Context, conn net.Conn, cfg HandshakeConfig, logger *
 	if conn == nil {
 		return nil, fmt.Errorf("mesh: handshake: nil conn")
 	}
-	hs, err := noise.NewHandshakeState(noise.Config{
-		CipherSuite:   defaultCipherSuite(),
-		Random:        rand.Reader,
-		Pattern:       noise.HandshakeXX,
-		Initiator:     cfg.Initiator,
-		Prologue:      prologue,
-		StaticKeypair: cfg.StaticKey.dh,
-	})
+	hs, err := newHandshakeState(cfg.StaticKey, cfg.Initiator)
 	if err != nil {
 		return nil, fmt.Errorf("mesh: handshake init: %w", err)
 	}
@@ -141,4 +134,15 @@ func runResponder(ctx context.Context, l *Link, hs *noise.HandshakeState) (send,
 		return nil, nil, fmt.Errorf("mesh: handshake msg3: cipher states not produced")
 	}
 	return cs2, cs1, nil
+}
+
+func newHandshakeState(key StaticKey, initiator bool) (*noise.HandshakeState, error) {
+	return noise.NewHandshakeState(noise.Config{
+		CipherSuite:   defaultCipherSuite(),
+		Random:        rand.Reader,
+		Pattern:       noise.HandshakeXX,
+		Initiator:     initiator,
+		Prologue:      prologue,
+		StaticKeypair: key.dh,
+	})
 }
