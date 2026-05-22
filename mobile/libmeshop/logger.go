@@ -24,7 +24,3 @@ func (w *loggerWriter) Write(p []byte) (int, error) {
 }
 
 var _ io.Writer = (*loggerWriter)(nil)
-
-func _newSilentLogger() *slog.Logger {
-	return slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{}))
-}
